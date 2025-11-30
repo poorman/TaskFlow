@@ -1,0 +1,168 @@
+version: '3.3'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: taskflow-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-taskflow}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-taskflow}
+      POSTGRES_DB: ${POSTGRES_DB:-taskflow}
+    # ports:
+    #   - "5433:5432"  # Not needed externally
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U taskflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - taskflow-network
+
+  redis:
+    image: redis:7-alpine
+    container_name: taskflow-redis
+    # ports:
+    #   - "6380:6379"  # Not needed externally
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - taskflow-network
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: taskflow-backend
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://taskflow:taskflow@postgres:5432/taskflow}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      SECRET_KEY: ${SECRET_KEY:-your-secret-key-change-in-production-generate-with-openssl-rand-hex-32}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3014,http://localhost:3000,https://admin.widesurf.com}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      GOOGLE_REDIRECT_URI: https://admin.widesurf.com/api/v1/auth/google/callback
+    # ports:
+    #   - "8000:8000"  # Exposed via Traefik only
+    volumes:
+      - ./backend:/app
+    depends_on:
+      - postgres
+      - redis
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    networks:
+      - taskflow-network
+      - traefik-proxy
+    labels:
+      - "traefik.enable=true"
+      # API routes for admin.widesurf.com
+      - "traefik.http.routers.taskflow-backend.rule=Host(`admin.widesurf.com`) && (PathPrefix(`/api`) || PathPrefix(`/docs`) || PathPrefix(`/redoc`) || PathPrefix(`/openapi.json`) || Path(`/health`))"
+      - "traefik.http.routers.taskflow-backend.entrypoints=websecure"
+      - "traefik.http.routers.taskflow-backend.tls=true"
+      - "traefik.http.routers.taskflow-backend.tls.certresolver=le"
+      - "traefik.http.services.taskflow-backend.loadbalancer.server.port=8000"
+      - "traefik.http.services.taskflow-backend.loadbalancer.passhostheader=true"
+      # Increase timeout for slow queries
+      - "traefik.http.services.taskflow-backend.loadbalancer.responseforwarding.flushinterval=1ms"
+      # HTTP to HTTPS redirect for API
+      - "traefik.http.routers.taskflow-backend-http.rule=Host(`admin.widesurf.com`) && (PathPrefix(`/api`) || PathPrefix(`/docs`) || PathPrefix(`/redoc`) || Path(`/health`))"
+      - "traefik.http.routers.taskflow-backend-http.entrypoints=web"
+      - "traefik.http.routers.taskflow-backend-http.middlewares=redirect-https"
+      - "traefik.http.middlewares.redirect-https.redirectscheme.scheme=https"
+      - "traefik.docker.network=pbieda-portfolio_traefik-proxy"
+
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: taskflow-celery-worker
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://taskflow:taskflow@postgres:5432/taskflow}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+    volumes:
+      - ./backend:/app
+      - ./data-pipeline:/app/data-pipeline
+    depends_on:
+      - postgres
+      - redis
+    command: celery -A data-pipeline.pipeline_worker worker --loglevel=info
+    networks:
+      - taskflow-network
+
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: taskflow-celery-beat
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://taskflow:taskflow@postgres:5432/taskflow}
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+    volumes:
+      - ./backend:/app
+      - ./data-pipeline:/app/data-pipeline
+    depends_on:
+      - postgres
+      - redis
+    command: celery -A data-pipeline.pipeline_worker beat --loglevel=info
+    networks:
+      - taskflow-network
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: taskflow-frontend
+    environment:
+      NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://admin.widesurf.com}
+    # ports:
+    #   - "3014:3014"  # Exposed via Traefik only
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+      - /app/.next
+    depends_on:
+      - backend
+    command: npm run dev
+    networks:
+      - taskflow-network
+      - traefik-proxy
+    labels:
+      - "traefik.enable=true"
+      # Frontend routes for admin.widesurf.com
+      - "traefik.http.routers.taskflow-frontend.rule=Host(`admin.widesurf.com`) && !(PathPrefix(`/api`) || PathPrefix(`/docs`) || PathPrefix(`/redoc`) || PathPrefix(`/openapi.json`) || Path(`/health`))"
+      - "traefik.http.routers.taskflow-frontend.entrypoints=websecure"
+      - "traefik.http.routers.taskflow-frontend.tls=true"
+      - "traefik.http.routers.taskflow-frontend.tls.certresolver=le"
+      - "traefik.http.services.taskflow-frontend.loadbalancer.server.port=3014"
+      - "traefik.http.services.taskflow-frontend.loadbalancer.passhostheader=true"
+      - "traefik.http.services.taskflow-frontend.loadbalancer.responseforwarding.flushinterval=1s"
+      # HTTP to HTTPS redirect middleware for frontend
+      - "traefik.http.middlewares.taskflow-frontend-redirect.redirectscheme.scheme=https"
+      # HTTP to HTTPS redirect for frontend
+      - "traefik.http.routers.taskflow-frontend-http.rule=Host(`admin.widesurf.com`) && !(PathPrefix(`/api`) || PathPrefix(`/docs`) || PathPrefix(`/redoc`) || Path(`/health`))"
+      - "traefik.http.routers.taskflow-frontend-http.entrypoints=web"
+      - "traefik.http.routers.taskflow-frontend-http.middlewares=taskflow-frontend-redirect"
+      - "traefik.docker.network=pbieda-portfolio_traefik-proxy"
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  taskflow-network:
+    driver: bridge
+  traefik-proxy:
+    external: true
+
