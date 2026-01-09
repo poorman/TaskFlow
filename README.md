@@ -2,6 +2,8 @@
 
 A production-ready task management platform built as a SaaS application, demonstrating full-stack development, data pipelines, multi-tenant architecture, and real-time features.
 
+<img width="1200" height="600" alt="image" src="https://github.com/user-attachments/assets/68ef89a4-2609-4a2d-aa2e-0b5d04990f02" />
+
 ## 🎯 Project Purpose
 
 **TaskFlow** is a comprehensive task management system designed for both personal productivity and as a portfolio piece demonstrating skills relevant to quantitative trading firms. This project showcases:
